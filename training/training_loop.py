@@ -65,6 +65,57 @@ def setup_snapshot_image_grid(training_set, random_seed=0):
 
 #----------------------------------------------------------------------------
 
+def save_color_triad_debug_data(images, debug_datas, fname):
+    nrows = 10  # hard-coded
+    ncols = 3
+
+    _B, C, H, W = images[0].shape
+    Whalf = W // 2
+    Hrep0 = H // 3
+    Hrep1 = Hrep0
+    Hrep2 = H - Hrep0 - Hrep1
+
+    # TODO: make faster
+    result = np.zeros((H * nrows, ncols * (W * 5 + Whalf * 2) + (ncols - 1) * W, 4), dtype=np.float32)
+
+    for col in range(ncols):
+        # Each column contains: final_img (gap) colors (gap) weight0 weight1 weight2 (gap gap)
+        # B x C x H x W -> H * nrows x W x C
+        final_img = images[col][0:nrows, ...].detach().cpu().numpy()
+        final_img = final_img.transpose(0, 2, 3, 1).reshape(nrows * H, W, C)
+        final_img = (final_img + 1) * 255 / 2
+
+        # B x C x ncolors ->   H * nrows x W x C
+        # B x C x ncolors -> B x ncolors x 1 x C
+        colors = debug_datas[col]['colors'][0:nrows, ...].detach().cpu().numpy().transpose(0, 2, 1)
+        colors_img = np.zeros_like(final_img)
+        for r in range(nrows):
+            colors_img[r*H:r*H+Hrep0, :, :] = colors[r, 0, :].reshape((1, 1, -1))
+            colors_img[r*H+Hrep0:r*H+Hrep0+Hrep1, :, :] = colors[r, 1, :].reshape((1, 1, -1))
+            colors_img[r*H+Hrep0+Hrep1:(r+1)*H, :, :] = colors[r, 2, :].reshape((1, 1, -1))
+        colors_img = (colors_img + 1) * 255 / 2
+
+        uvs = debug_datas[col]['uvs'][0:nrows, ...].detach().cpu().numpy() * 255
+        uvs = uvs.transpose(0, 2, 3, 1).reshape(nrows * H, W, 3)
+
+        cstart = col * W * 7
+        result[:, cstart:cstart + W, 0:3] = final_img
+        result[:, cstart:cstart + W, 3] = 255
+        cstart = cstart + W + Whalf
+        result[:, cstart:cstart + W, 0:3] = colors_img
+        result[:, cstart:cstart + W, 3] = 255
+        cstart = cstart + W + Whalf
+        result[:, cstart:cstart + W, 0:3] = np.expand_dims(uvs[:, :, 0], -1)
+        result[:, cstart:cstart + W * 3, 3] = 255
+        cstart = cstart + W
+        result[:, cstart:cstart + W, 0:3] = np.expand_dims(uvs[:, :, 1], -1)
+        cstart = cstart + W
+        result[:, cstart:cstart + W, 0:3] = np.expand_dims(uvs[:, :, 2], -1)
+
+    result = np.rint(result).clip(0, 255).astype(np.uint8)
+    PIL.Image.fromarray(result, 'RGBA').save(fname)
+    return 0
+
 def save_image_grid(img, fname, drange, grid_size):
     lo, hi = drange
     img = np.asarray(img, dtype=np.float32)
@@ -178,7 +229,8 @@ def training_loop(
     if rank == 0:
         print(f'Distributing across {num_gpus} GPUs...')
     ddp_modules = dict()
-    for name, module in [('G_mapping', G.mapping), ('G_synthesis', G.synthesis), ('D', D), (None, G_ema), ('augment_pipe', augment_pipe)]:
+
+    for name, module in [('G', G), ('D', D), (None, G_ema), ('augment_pipe', augment_pipe)]:
         if (num_gpus > 1) and (module is not None) and len(list(module.parameters())) != 0:
             module.requires_grad_(True)
             module = torch.nn.parallel.DistributedDataParallel(module, device_ids=[device], broadcast_buffers=False)
@@ -283,9 +335,13 @@ def training_loop(
             # Update weights.
             phase.module.requires_grad_(False)
             with torch.autograd.profiler.record_function(phase.name + '_opt'):
-                for param in phase.module.parameters():
+                for param_name, param in phase.module.named_parameters():
                     if param.grad is not None:
+                        #_tmean = torch.mean(param.grad)
                         misc.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
+                        #print('{} ({}) grad: {} (orig {})'.format(param_name, torch.mean(param.data), torch.mean(param.grad), _tmean))
+                    # else:
+                    #     print('{} grad: None'.format(param_name))
                 phase.opt.step()
             if phase.end_event is not None:
                 phase.end_event.record(torch.cuda.current_stream(device))
@@ -343,8 +399,13 @@ def training_loop(
 
         # Save image snapshot.
         if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
-            images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
+            results = [G_ema(z=z, c=c, return_debug_data=True, noise_mode='const') for z, c in zip(grid_z, grid_c)]
+            images = torch.cat([x[0].cpu() for x in results]).numpy()
             save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
+            if G_kwargs.color_triads is not None:
+                save_color_triad_debug_data([x[0] for x in results],
+                                            [x[1] for x in results],
+                                            os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_debug.png'))
 
         # Save network snapshot.
         snapshot_pkl = None

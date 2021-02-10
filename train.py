@@ -33,6 +33,7 @@ def setup_training_loop_kwargs(
     # General options (not included in desc).
     gpus       = None, # Number of GPUs: <int>, default = 1 gpu
     snap       = None, # Snapshot interval: <int>, default = 50 ticks
+    image_snap = None, # Overrides snap for images <int>
     metrics    = None, # List of metric names: [], ['fid50k_full'] (default), ...
     seed       = None, # Random seed: <int>, default = 0
 
@@ -63,6 +64,10 @@ def setup_training_loop_kwargs(
     nhwc       = None, # Use NHWC memory format with FP16: <bool>, default = False
     nobench    = None, # Disable cuDNN benchmarking: <bool>, default = False
     workers    = None, # Override number of DataLoader workers: <int>, default = 3
+
+    # Custom
+    color_triads = None,
+    synthesis_arch = None,
 ):
     args = dnnlib.EasyDict()
 
@@ -82,7 +87,7 @@ def setup_training_loop_kwargs(
     assert isinstance(snap, int)
     if snap < 1:
         raise UserError('--snap must be at least 1')
-    args.image_snapshot_ticks = snap
+    args.image_snapshot_ticks = image_snap if (image_snap is not None) else snap
     args.network_snapshot_ticks = snap
 
     if metrics is None:
@@ -172,13 +177,15 @@ def setup_training_loop_kwargs(
         spec.gamma = 0.0002 * (res ** 2) / spec.mb # heuristic formula
         spec.ema = spec.mb * 10 / 32
 
-    args.G_kwargs = dnnlib.EasyDict(class_name='training.networks.Generator', z_dim=512, w_dim=512, mapping_kwargs=dnnlib.EasyDict(), synthesis_kwargs=dnnlib.EasyDict())
+    args.G_kwargs = dnnlib.EasyDict(class_name='training.networks.Generator', z_dim=512, w_dim=512, mapping_kwargs=dnnlib.EasyDict(), synthesis_kwargs=dnnlib.EasyDict(), color_triads=color_triads)
     args.D_kwargs = dnnlib.EasyDict(class_name='training.networks.Discriminator', block_kwargs=dnnlib.EasyDict(), mapping_kwargs=dnnlib.EasyDict(), epilogue_kwargs=dnnlib.EasyDict())
     args.G_kwargs.synthesis_kwargs.channel_base = args.D_kwargs.channel_base = int(spec.fmaps * 32768)
     args.G_kwargs.synthesis_kwargs.channel_max = args.D_kwargs.channel_max = 512
     args.G_kwargs.mapping_kwargs.num_layers = spec.map
     args.G_kwargs.synthesis_kwargs.num_fp16_res = args.D_kwargs.num_fp16_res = 4 # enable mixed-precision training
     args.G_kwargs.synthesis_kwargs.conv_clamp = args.D_kwargs.conv_clamp = 256 # clamp activations to avoid float16 overflow
+    if synthesis_arch is not None:
+        args.G_kwargs.synthesis_kwargs.architecture = synthesis_arch
     args.D_kwargs.epilogue_kwargs.mbstd_group_size = spec.mbstd
 
     args.G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=spec.lrate, betas=[0,0.99], eps=1e-8)
@@ -395,6 +402,7 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--outdir', help='Where to save the results', required=True, metavar='DIR')
 @click.option('--gpus', help='Number of GPUs to use [default: 1]', type=int, metavar='INT')
 @click.option('--snap', help='Snapshot interval [default: 50 ticks]', type=int, metavar='INT')
+@click.option('--image_snap', help='Overrides snap for images', type=int, metavar='INT')
 @click.option('--metrics', help='Comma-separated list or "none" [default: fid50k_full]', type=CommaSeparatedList())
 @click.option('--seed', help='Random seed [default: 0]', type=int, metavar='INT')
 @click.option('-n', '--dry-run', help='Print training options and exit', is_flag=True)
@@ -426,6 +434,10 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--nhwc', help='Use NHWC memory format with FP16', type=bool, metavar='BOOL')
 @click.option('--nobench', help='Disable cuDNN benchmarking', type=bool, metavar='BOOL')
 @click.option('--workers', help='Override number of DataLoader workers', type=int, metavar='INT')
+
+# Custom
+@click.option('--color_triads', help='Run a custom color triad network', type=int, metavar='INT')
+@click.option('--synthesis_arch', help='Type of generator architecture', type=click.Choice(['orig', 'skip', 'resnet']))
 
 def main(ctx, outdir, dry_run, **config_kwargs):
     """Train a GAN using the techniques described in the paper

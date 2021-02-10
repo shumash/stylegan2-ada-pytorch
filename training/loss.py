@@ -21,11 +21,12 @@ class Loss:
 #----------------------------------------------------------------------------
 
 class StyleGAN2Loss(Loss):
-    def __init__(self, device, G_mapping, G_synthesis, D, augment_pipe=None, style_mixing_prob=0.9, r1_gamma=10, pl_batch_shrink=2, pl_decay=0.01, pl_weight=2):
+    def __init__(self, device, G, D, augment_pipe=None, style_mixing_prob=0.9,
+                 r1_gamma=10, pl_batch_shrink=2, pl_decay=0.01, pl_weight=2,
+                 wasserstein=False):
         super().__init__()
         self.device = device
-        self.G_mapping = G_mapping
-        self.G_synthesis = G_synthesis
+        self.G = G
         self.D = D
         self.augment_pipe = augment_pipe
         self.style_mixing_prob = style_mixing_prob
@@ -36,15 +37,9 @@ class StyleGAN2Loss(Loss):
         self.pl_mean = torch.zeros([], device=device)
 
     def run_G(self, z, c, sync):
-        with misc.ddp_sync(self.G_mapping, sync):
-            ws = self.G_mapping(z, c)
-            if self.style_mixing_prob > 0:
-                with torch.autograd.profiler.record_function('style_mixing'):
-                    cutoff = torch.empty([], dtype=torch.int64, device=ws.device).random_(1, ws.shape[1])
-                    cutoff = torch.where(torch.rand([], device=ws.device) < self.style_mixing_prob, cutoff, torch.full_like(cutoff, ws.shape[1]))
-                    ws[:, cutoff:] = self.G_mapping(torch.randn_like(z), c, skip_w_avg_update=True)[:, cutoff:]
-        with misc.ddp_sync(self.G_synthesis, sync):
-            img = self.G_synthesis(ws)
+        with misc.ddp_sync(self.G, sync):
+            img, data = self.G(z, c, return_debug_data=True, style_mixing_prob=self.style_mixing_prob)
+            ws = data['ws']
         return img, ws
 
     def run_D(self, img, c, sync):
@@ -68,7 +63,7 @@ class StyleGAN2Loss(Loss):
                 gen_logits = self.run_D(gen_img, gen_c, sync=False)
                 training_stats.report('Loss/scores/fake', gen_logits)
                 training_stats.report('Loss/signs/fake', gen_logits.sign())
-                loss_Gmain = torch.nn.functional.softplus(-gen_logits) # -log(sigmoid(gen_logits))
+                loss_Gmain = torch.nn.functional.softplus(-gen_logits) # -log(sigmoid(gen_logits))+
                 training_stats.report('Loss/G/loss', loss_Gmain)
             with torch.autograd.profiler.record_function('Gmain_backward'):
                 loss_Gmain.mean().mul(gain).backward()

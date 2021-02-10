@@ -171,6 +171,43 @@ class Conv2dLayer(torch.nn.Module):
 #----------------------------------------------------------------------------
 
 @persistence.persistent_class
+class ColorMappingNetwork(torch.nn.Module):
+    def __init__(self,
+                 w_dim,
+                 layer_features=[128, 32],
+                 activation='lrelu',
+                 normalize=True):
+        super().__init__()
+
+        self.layers = []
+        if layer_features is None:
+            fcsizes = [9]
+        else:
+            fcsizes = layer_features + [9]
+
+        prev_input_size = w_dim
+        for idx, nfeats in enumerate(fcsizes):
+            self.layers.append(FullyConnectedLayer(prev_input_size, nfeats, activation=activation))
+            prev_input_size = nfeats
+            setattr(self, f'fc{idx}', self.layers[-1])  # Add as attribute to ensure it's registered
+
+        # TODO: explore architectures
+        self.normalize = normalize
+
+    def forward(self, w):
+        """
+        input:  B x w_dim
+        output: B x 3 (n_ch) x 3 (n_colors)
+        """
+        colors = w
+        for layer in self.layers:
+            colors = layer(colors)
+        colors = colors.reshape((-1, 3, 3))
+        if self.normalize:
+            colors = torch.tanh(colors)
+        return colors
+
+@persistence.persistent_class
 class MappingNetwork(torch.nn.Module):
     def __init__(self,
         z_dim,                      # Input latent (Z) dimensionality, 0 = no latent.
@@ -322,6 +359,30 @@ class ToRGBLayer(torch.nn.Module):
         x = modulated_conv2d(x=x, weight=self.weight, styles=styles, demodulate=False, fused_modconv=fused_modconv)
         x = bias_act.bias_act(x, self.bias.to(x.dtype), clamp=self.conv_clamp)
         return x
+
+
+# @persistence.persistent_class
+# class ToRGBColorTriadLayer(torch.nn.Module):
+#     def __init__(self, in_channels, out_channels, w_dim, kernel_size=1, conv_clamp=None, channels_last=False):
+#         super().__init__()
+#         self.conv_clamp = conv_clamp
+#         self.affine = FullyConnectedLayer(w_dim, in_channels + 9, bias_init=1)
+#         memory_format = torch.channels_last if channels_last else torch.contiguous_format
+#         self.weight = torch.nn.Parameter(torch.randn([out_channels, in_channels, kernel_size, kernel_size]).to(memory_format=memory_format))
+#         self.bias = torch.nn.Parameter(torch.zeros([out_channels]))
+#         self.weight_gain = 1 / np.sqrt(in_channels * (kernel_size ** 2))
+#
+#     def forward(self, x, w, fused_modconv=True):
+#         scaled = self.affine(w) * self.weight_gain
+#         colors = scaled[...]
+#         styles = scaled[...]
+#         x = modulated_conv2d(x=x, weight=self.weight, styles=styles, demodulate=False, fused_modconv=fused_modconv)
+#         x = bias_act.bias_act(x, self.bias.to(x.dtype), clamp=self.conv_clamp)
+#         uvs = torch.softmax(img, dim=1)
+#         debug_data['uvs'] = uvs
+#         # B x C x ncolors
+#         img = torch.sum(uvs.unsqueeze(1) * colors.unsqueeze(-1).unsqueeze(-1), dim=2)
+#         return x
 
 #----------------------------------------------------------------------------
 
@@ -483,6 +544,7 @@ class Generator(torch.nn.Module):
         img_channels,               # Number of output color channels.
         mapping_kwargs      = {},   # Arguments for MappingNetwork.
         synthesis_kwargs    = {},   # Arguments for SynthesisNetwork.
+        color_triads        = None  # Special setting for generating from color triad space
     ):
         super().__init__()
         self.z_dim = z_dim
@@ -490,14 +552,49 @@ class Generator(torch.nn.Module):
         self.w_dim = w_dim
         self.img_resolution = img_resolution
         self.img_channels = img_channels
-        self.synthesis = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, **synthesis_kwargs)
+
+        synthesis_out_channels = img_channels if color_triads is None else 3
+        self.synthesis = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution,
+                                          img_channels=synthesis_out_channels, **synthesis_kwargs)
         self.num_ws = self.synthesis.num_ws
         self.mapping = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
 
-    def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, **synthesis_kwargs):
+        self.color_mapping = None
+        if color_triads is not None:
+            self.color_mapping = ColorMappingNetwork(w_dim=w_dim, normalize=True)
+
+
+    def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, return_debug_data=False, style_mixing_prob=0, **synthesis_kwargs):
         ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
-        img = self.synthesis(ws, **synthesis_kwargs)
-        return img
+        if style_mixing_prob > 0:
+            # Style mixing
+            with torch.autograd.profiler.record_function('style_mixing'):
+                cutoff = torch.empty([], dtype=torch.int64, device=ws.device).random_(1, ws.shape[1])
+                cutoff = torch.where(torch.rand([], device=ws.device) < style_mixing_prob, cutoff,
+                                     torch.full_like(cutoff, ws.shape[1]))
+                ws[:, cutoff:] = self.mapping(torch.randn_like(z), c,
+                                              truncation_psi=truncation_psi,
+                                              truncation_cutoff=truncation_cutoff,
+                                              skip_w_avg_update=True)[:, cutoff:]
+        debug_data = {}
+        debug_data['ws'] = ws
+        img = self.synthesis(ws, **synthesis_kwargs)  # B x ncolors x W x W
+        debug_data['raw_img'] = img
+
+        if self.color_mapping:
+            # B x C x ncolors
+            colors = self.color_mapping(ws[:, 0, :])
+            debug_data['colors'] = colors
+            uvs = torch.softmax(img, dim=1)
+            debug_data['uvs'] = uvs
+            # B x C x ncolors
+            img = torch.sum(uvs.unsqueeze(1) * colors.unsqueeze(-1).unsqueeze(-1), dim=2)
+
+        if return_debug_data:
+            return img, debug_data
+        else:
+            return img
+
 
 #----------------------------------------------------------------------------
 
